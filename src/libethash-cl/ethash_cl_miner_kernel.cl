@@ -179,13 +179,13 @@ void keccak_f1600_no_absorb(ulong* a, uint in_size, uint out_size, uint isolate)
 		// much we try and help the compiler save VGPRs because it seems to throw
 		// that information away, hence the implementation of keccak here
 		// doesn't bother.
-		if (isolate) 
+		if (isolate)
 		{
 			keccak_f1600_round((uint2*)a, r++, 25);
 		}
 	}
 	while (r < 23);
-	
+
 	// final round optimised for digest size
 	keccak_f1600_round((uint2*)a, r++, out_size);
 }
@@ -232,7 +232,7 @@ hash64_t init_hash(__constant hash32_t const* header, ulong nonce, uint isolate)
 	hash64_t init;
 	uint const init_size = countof(init.ulongs);
 	uint const hash_size = countof(header->ulongs);
-	
+
 	// sha3_512(header .. nonce)
 	ulong state[25];
 	copy(state, header->ulongs, hash_size);
@@ -243,7 +243,7 @@ hash64_t init_hash(__constant hash32_t const* header, ulong nonce, uint isolate)
 	return init;
 }
 
-uint inner_loop(uint4 init, uint thread_id, __local uint* share, __global hash128_t const* g_dag, uint isolate)
+uint inner_loop(uint4 init, uint thread_id, __local uint* share, __global hash128_t const* g_dag, __global hash128_t const* g_dag1, __global hash128_t const* g_dag2, __global hash128_t const* g_dag3, uint isolate)
 {
 	uint4 mix = init;
 
@@ -268,10 +268,9 @@ uint inner_loop(uint4 init, uint thread_id, __local uint* share, __global hash12
 			}
 			barrier(CLK_LOCAL_MEM_FENCE);
 
-			mix = fnv4(mix, g_dag[*share].uint4s[thread_id]);
+			mix = fnv4(mix, *share>=3 * DAG_SIZE / 4 ? g_dag3[*share - 3 * DAG_SIZE / 4].uint4s[thread_id] : *share>=DAG_SIZE / 2 ? g_dag2[*share - DAG_SIZE / 2].uint4s[thread_id] : *share>=DAG_SIZE / 4 ? g_dag1[*share - DAG_SIZE / 4].uint4s[thread_id]:g_dag[*share].uint4s[thread_id]);
 		}
-	}
-	while ((a += 4) != (ACCESSES & isolate));
+	} while ((a += 4) != (ACCESSES & isolate));
 
 	return fnv_reduce(mix);
 }
@@ -309,7 +308,7 @@ hash32_t compute_hash_simple(
 	{
 		mix.uint4s[i] = init.uint4s[i % countof(init.uint4s)];
 	}
-	
+
 	uint mix_val = mix.uints[0];
 	uint init0 = mix.uints[0];
 	uint a = 0;
@@ -333,7 +332,7 @@ hash32_t compute_hash_simple(
 	{
 		fnv_mix.uints[i] = fnv_reduce(mix.uint4s[i]);
 	}
-	
+
 	return final_hash(&init, &fnv_mix, isolate);
 }
 
@@ -351,6 +350,9 @@ hash32_t compute_hash(
 	__local compute_hash_share* share,
 	__constant hash32_t const* g_header,
 	__global hash128_t const* g_dag,
+	__global hash128_t const* g_dag1,
+	__global hash128_t const* g_dag2,
+	__global hash128_t const* g_dag3,
 	ulong nonce,
 	uint isolate
 	)
@@ -376,7 +378,7 @@ hash32_t compute_hash(
 		uint4 thread_init = share[hash_id].init.uint4s[thread_id % (64 / sizeof(uint4))];
 		barrier(CLK_LOCAL_MEM_FENCE);
 
-		uint thread_mix = inner_loop(thread_init, thread_id, share[hash_id].mix.uints, g_dag, isolate);
+		uint thread_mix = inner_loop(thread_init, thread_id, share[hash_id].mix.uints, g_dag, g_dag1, g_dag2, g_dag3, isolate);
 
 		share[hash_id].mix.uints[thread_id] = thread_mix;
 		barrier(CLK_LOCAL_MEM_FENCE);
@@ -415,9 +417,10 @@ __kernel void ethash_search_simple(
 {
 	uint const gid = get_global_id(0);
 	hash32_t hash = compute_hash_simple(g_header, g_dag, start_nonce + gid, isolate);
-	if (as_ulong(as_uchar8(hash.ulongs[0]).s76543210) < target)
+
+	if (hash.ulongs[countof(hash.ulongs)-1] < target)
 	{
-		uint slot = min(MAX_OUTPUTS, atomic_inc(&g_output[0]) + 1);
+		uint slot = min(convert_uint(MAX_OUTPUTS), convert_uint(atomic_inc(&g_output[0]) + 1));
 		g_output[slot] = gid;
 	}
 }
@@ -427,6 +430,9 @@ __kernel void ethash_hash(
 	__global hash32_t* g_hashes,
 	__constant hash32_t const* g_header,
 	__global hash128_t const* g_dag,
+	__global hash128_t const* g_dag1,
+	__global hash128_t const* g_dag2,
+	__global hash128_t const* g_dag3,
 	ulong start_nonce,
 	uint isolate
 	)
@@ -434,7 +440,7 @@ __kernel void ethash_hash(
 	__local compute_hash_share share[HASHES_PER_LOOP];
 
 	uint const gid = get_global_id(0);
-	g_hashes[gid] = compute_hash(share, g_header, g_dag, start_nonce + gid, isolate);
+	g_hashes[gid] = compute_hash(share, g_header, g_dag, g_dag1, g_dag2, g_dag3,start_nonce + gid, isolate);
 }
 
 __attribute__((reqd_work_group_size(GROUP_SIZE, 1, 1)))
@@ -442,6 +448,9 @@ __kernel void ethash_search(
 	__global volatile uint* restrict g_output,
 	__constant hash32_t const* g_header,
 	__global hash128_t const* g_dag,
+	__global hash128_t const* g_dag1,
+	__global hash128_t const* g_dag2,
+	__global hash128_t const* g_dag3,
 	ulong start_nonce,
 	ulong target,
 	uint isolate
@@ -450,11 +459,11 @@ __kernel void ethash_search(
 	__local compute_hash_share share[HASHES_PER_LOOP];
 
 	uint const gid = get_global_id(0);
-	hash32_t hash = compute_hash(share, g_header, g_dag, start_nonce + gid, isolate);
+	hash32_t hash = compute_hash(share, g_header, g_dag, g_dag1, g_dag2, g_dag3, start_nonce + gid, isolate);
 
 	if (as_ulong(as_uchar8(hash.ulongs[0]).s76543210) < target)
 	{
-		uint slot = min(MAX_OUTPUTS, atomic_inc(&g_output[0]) + 1);
+		uint slot = min(convert_uint(MAX_OUTPUTS), convert_uint(atomic_inc(&g_output[0]) + 1));
 		g_output[slot] = gid;
 	}
 }
